@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Generated runtime data / outputs
+snapshots/
+sample_video.mp4
+events.csv
+session_summary.json
+
+# Pretrained model weights (downloaded, not source)
+yolov8n.pt
