@@ -84,7 +84,7 @@ via `.gitignore`.
 
 ## Sports mode
 
-<!-- heat map GIF goes here -->
+![Sports mode on game footage: player tracking, distance covered, and a heat map building up](sports_heatmap.gif)
 
 I adapted the tracking pipeline to game footage. With `--sports`, the script tracks only people, turns off the restricted zone and loitering alerts, and measures how far each player moves.
 
@@ -93,6 +93,7 @@ I adapted the tracking pipeline to game footage. With `--sports`, the script tra
 - Distance covered per player, shown on each box and in a live top-5 leaderboard
 - A heat map that builds over the whole clip and shows where play actually happened
 - Per-player distances in `session_summary.json`, sorted from most to least
+- `make_heatmap_gif.py` turns a stretch of the annotated video into a looping GIF (`--start-seconds`, `--duration-seconds`)
 
 ### How distance is measured
 
