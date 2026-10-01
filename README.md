@@ -2,6 +2,8 @@
 
 A small demo that mimics the "Intelligent Analytics" features of a commercial
 Video-Surveillance-as-a-Service (VSaaS) product, built on top of YOLOv8.
+It also has a sports mode that tracks players in game footage and measures how
+far each one runs. See [Sports mode](#sports-mode).
 
 ## Features
 
@@ -55,6 +57,7 @@ python updatedmain.py --source other.mp4
 python updatedmain.py --save-video           # also writes annotated_output.mp4
 python updatedmain.py --headless             # no display window (servers/testing)
 python updatedmain.py --headless --max-frames 500
+python updatedmain.py --sports --source game.mp4 --save-video # sports mode
 ```
 
 Keyboard controls while `updatedmain.py` is running:
@@ -78,3 +81,30 @@ Keyboard controls while `updatedmain.py` is running:
 
 These are runtime-generated artifacts and are excluded from version control
 via `.gitignore`.
+
+## Sports mode
+
+<!-- heat map GIF goes here -->
+
+I adapted the tracking pipeline to game footage. With `--sports`, the script tracks only people, turns off the restricted zone and loitering alerts, and measures how far each player moves.
+
+### What it adds
+
+- Distance covered per player, shown on each box and in a live top-5 leaderboard
+- A heat map that builds over the whole clip and shows where play actually happened
+- Per-player distances in `session_summary.json`, sorted from most to least
+
+### How distance is measured
+
+Each frame, the script measures how far a player's center moved since the last frame and adds it to their total. Steps under 2 pixels are skipped because detection boxes wobble slightly even when someone stands still. Steps over 120 pixels are skipped because a jump that large almost always means the tracker swapped IDs between two players. Both thresholds are set at the top of `updatedmain.py`.
+
+### Limitations
+
+- Distances are in pixels, not meters. A player far from the camera covers fewer pixels for the same run.
+- The camera needs to stay still. If it pans, every player appears to move.
+- A player who leaves the frame and comes back can get a new ID, which splits their distance across two entries.
+
+### Next steps
+
+- Convert pixels to meters by mapping the field's corners to real coordinates (a homography).
+- Identify players by jersey number so IDs stay stable across the whole game.
