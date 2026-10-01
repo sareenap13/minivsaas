@@ -8,6 +8,9 @@ snapshots/
 sample_video.mp4
 events.csv
 session_summary.json
+*.mov
+*.mp4
+.idea/
 
 # Pretrained model weights (downloaded, not source)
 yolov8n.pt

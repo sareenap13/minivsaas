@@ -44,6 +44,10 @@ log_file = "events.csv"
 snapshot_dir = "snapshots"
 summary_file = "session_summary.json"
 relevant_classes = {"person", "car", "truck", "backpack", "handbag", "suitcase"}
+# sports mode: distance tracking
+min_counted_step_pixels = 2.0     # smaller moves are box jitter, not running
+max_plausible_step_pixels = 120.0 # bigger jumps are tracker ID swaps, not running
+distance_leaderboard_size = 5     # how many players to list on the dashboard
 
 # heat map configuration
 heat_decay = 0.985 # per-frame fade (closer to 1.0 = longer memory)
@@ -102,6 +106,24 @@ def get_direction(trail):
     idx = int((angle + 22.5) // 45) % 8
     return _COMPASS[idx]
 
+
+"""
+Sports mode: adds the distance a player moved since the previous frame to
+their running total. Skips jitter and tracker ID-swap jumps.
+"""
+def accumulate_player_distance(distance_pixels_by_player_id, last_centroid_by_player_id,
+                               player_id, current_centroid):
+    previous_centroid = last_centroid_by_player_id.get(player_id)
+    last_centroid_by_player_id[player_id] = current_centroid
+    if previous_centroid is None:
+        distance_pixels_by_player_id.setdefault(player_id, 0.0)
+        return
+    step_length_pixels = math.dist(previous_centroid, current_centroid)
+    if min_counted_step_pixels <= step_length_pixels <= max_plausible_step_pixels:
+        distance_pixels_by_player_id[player_id] = (
+            distance_pixels_by_player_id.get(player_id, 0.0) + step_length_pixels
+        )
+
 """
 Add weight to a square patch of the heat accumulator around (cx, cy).
 """
@@ -113,7 +135,7 @@ def stamp_heat(heat, cx, cy, weight, radius=heat_radius):
         heat[y0:y1, x0:x1] += weight
 
 """
-
+Render the accumulated heat map as a colored overlay on the frame.
 """
 def render_heat(frame, heat):
     peak = float(heat.max())
@@ -128,16 +150,31 @@ def render_heat(frame, heat):
     return np.where(mask, blended, frame)
 
 """
-
+Draw the analytics dashboard and statistics on the video frame.
 """
 def draw_dashboard(frame, stats):
-    lines = [
-        f"FPS: {stats['fps']:.1f}",
-        f"In frame: {stats['in_frame']}    Tracked total: {stats['total_unique']}",
-        f"Zone now: {stats['zone_now']}    Peak: {stats['zone_peak']}",
-        f"Active loiterers: {stats['loiterers']}",
-        "-- unique by class --",
-    ]
+    if stats.get("sports_mode"):
+        lines = [
+            f"FPS: {stats['fps']:.1f}",
+            f"Players in frame: {stats['in_frame']}    Tracked total: {stats['total_unique']}",
+            "-- distance covered (px) --",
+        ]
+        for player_id, distance_pixels in stats["distance_leaders"]:
+            lines.append(f"  ID{player_id:<6} {distance_pixels:,.0f}")
+    else:
+        lines = [
+            f"FPS: {stats['fps']:.1f}",
+            f"In frame: {stats['in_frame']}    Tracked total: {stats['total_unique']}",
+            f"Zone now: {stats['zone_now']}    Peak: {stats['zone_peak']}",
+            f"Active loiterers: {stats['loiterers']}",
+            "-- unique by class --",
+        ]
+        for cname, n in stats["unique_by_class"]:
+            lines.append(f"  {cname:<9} {n}")
+        if stats["in_frame_by_class"]:
+            lines.append("-- in frame now --")
+            for cname, n in stats["in_frame_by_class"]:
+                lines.append(f"  {cname:<9} {n}")
     for cname, n in stats["unique_by_class"]:
         lines.append(f"  {cname:<9} {n}")
     if stats["in_frame_by_class"]:
@@ -146,7 +183,7 @@ def draw_dashboard(frame, stats):
             lines.append(f"  {cname:<9} {n}")
 
     pad, lh = 10, 20
-    w = 260
+    w = 300 if stats.get("sports_mode") else 260
     h = pad * 2 + lh * len(lines)
     overlay = frame.copy()
     cv2.rectangle(overlay, (8, 8), (8 + w, 8 + h), (0, 0, 0), -1)
@@ -159,7 +196,7 @@ def draw_dashboard(frame, stats):
     return frame
 
 """
-
+Write the final session analytics and statistics to a JSON file.
 """
 def write_summary(stats, id_to_class, unique_by_class, elapsed):
     summary = {
@@ -173,12 +210,65 @@ def write_summary(stats, id_to_class, unique_by_class, elapsed):
         "peak_zone_occupancy": stats["zone_peak"],
         "loitering_alerts": stats["loiter_alerts"],
     }
+    if stats.get("sports_mode"):
+        summary["mode"] = "sports"
+        summary["distance_pixels_by_player"] = {
+            f"ID{player_id}": round(distance_pixels, 1)
+            for player_id, distance_pixels in sorted(
+                stats["distance_pixels_by_player_id"].items(), key=lambda kv: -kv[1]
+            )
+        }
+        summary["distance_note"] = (
+            "Pixel distance from each player's centroid path. Not meters, and a "
+            "player who leaves and re-enters frame may get a new ID."
+        )
+        summary.pop("peak_zone_occupancy")
+        summary.pop("loitering_alerts")
     with open(summary_file, "w") as f:
         json.dump(summary, f, indent = 2)
     print(f"\n[SUMMARY] written to {summary_file}")
     print(json.dumps(summary, indent = 2))
 
-def main(source, save_video = False, headless = False, max_frames = 0):
+"""
+Tracks how long an object has been inside the restricted zone. Returns
+(is_loitering, alert_triggered) and saves a highlighted snapshot when an alert fires.
+"""
+def update_loitering_status_and_alert(unique_id, inside, class_name, direction,
+                                      frame, box_corners, state):
+    if not inside:
+        state["zone_entry_time"].pop(unique_id, None)
+        return False, False
+
+    state["zone_entry_time"].setdefault(unique_id, time.time())
+
+    dwell = time.time() - state["zone_entry_time"][unique_id]
+
+    if dwell <= loiter_threshold:
+        return False, False
+
+    alert_triggered = False
+
+    if (time.time() - state["last_alert_time"][unique_id] > alert_cooldown):
+        x1, y1, x2, y2 = box_corners
+        snapshot = frame.copy()
+        cv2.rectangle(snapshot, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
+        cv2.putText(snapshot, f"ID {unique_id}", (int(x1), int(y1) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+        log_event(
+            "loitering",
+            unique_id,
+            class_name,
+            direction,
+            snapshot,
+        )
+
+        state["last_alert_time"][unique_id] = time.time()
+        alert_triggered = True
+
+    return True, alert_triggered
+
+def main(source, save_video = False, headless = False, max_frames = 0, sports_mode = False):
     if isinstance(source, str) and not os.path.exists(source):
         print(f"Could not find footage file: '{source}'")
         print("Update `source` at the top of this script, or pass --source path/to/video.mp4")
@@ -192,11 +282,13 @@ def main(source, save_video = False, headless = False, max_frames = 0):
     last_alert_time = defaultdict(float)   # id -> last alert time
     id_to_class = {}                       # id -> class name (last seen)
     unique_by_class = defaultdict(set)     # class -> {ids ever seen}
+    distance_pixels_by_player_id = {}      # sports mode: id -> total pixels covered
+    last_centroid_by_player_id = {}        # sports mode: id -> (cx, cy) last frame
 
     heat = None
     writer = None
 
-    show_heat, show_dash, show_zone, show_boxes = True, True, True, True
+    show_heat, show_dash, show_zone, show_boxes = True, True, not sports_mode, True
 
     # rolling stats
     frames = 0
@@ -209,7 +301,8 @@ def main(source, save_video = False, headless = False, max_frames = 0):
 
     results_stream = model.track(
         source = source, persist = True, conf = conf_threshold,
-        stream = True, verbose = False
+        stream = True, verbose = False,
+        classes = [0] if sports_mode else None
     )
 
     for result in results_stream:
@@ -253,30 +346,29 @@ def main(source, save_video = False, headless = False, max_frames = 0):
                 if len(trail) > trail_length:
                     trail.pop(0)
                 direction = get_direction(trail)
+                if sports_mode:
+                    accumulate_player_distance(distance_pixels_by_player_id,
+                                               last_centroid_by_player_id,
+                                               unique_id, (cx, cy))
 
-                inside = point_in_zone(cx, cy, restricted_zone)
-                is_loitering = False
+                inside = (not sports_mode and point_in_zone(cx, cy, restricted_zone))
+
                 if inside:
                     zone_now += 1
-                    zone_entry_time.setdefault(unique_id, time.time())
-                    dwell = time.time() - zone_entry_time[unique_id]
-                    if dwell > loiter_threshold:
-                        loiterers += 1
-                        is_loitering = True
-                    if (
-                        dwell > loiter_threshold
-                        and time.time() - last_alert_time[unique_id] > alert_cooldown
-                    ):
-                        snapshot = frame.copy()
-                        cv2.rectangle(snapshot, (int(x1), int(y1)),
-                                      (int(x2), int(y2)), (0, 0, 255), 3)
-                        cv2.putText(snapshot, f"ID {unique_id}", (int(x1), int(y1) - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                        log_event("loitering", unique_id, class_name, direction, snapshot)
-                        last_alert_time[unique_id] = time.time()
-                        loiter_alerts += 1
-                else:
-                    zone_entry_time.pop(unique_id, None)
+
+                is_loitering, alert_triggered = update_loitering_status_and_alert(unique_id, inside,
+                                            class_name, direction, frame, (x1, y1, x2, y2),
+                    {
+                        "zone_entry_time": zone_entry_time,
+                        "last_alert_time": last_alert_time,
+                    },
+                )
+
+                if is_loitering:
+                    loiterers += 1
+
+                if alert_triggered:
+                    loiter_alerts += 1
 
                 # feed the heat map (extra heat when loitering)
                 stamp_heat(heat, cx, cy,
@@ -286,7 +378,11 @@ def main(source, save_video = False, headless = False, max_frames = 0):
                 if show_boxes:
                     color = (0, 165, 255) if inside else (0, 255, 0)
                     cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                    label = f"ID{unique_id} {class_name} {direction}"
+                    if sports_mode:
+                        label = (f"ID{unique_id} {direction} "
+                                 f"{distance_pixels_by_player_id.get(unique_id, 0.0):,.0f}px")
+                    else:
+                        label = f"ID{unique_id} {class_name} {direction}"
                     cv2.putText(frame, label, (int(x1), int(y1) - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
@@ -314,6 +410,10 @@ def main(source, save_video = False, headless = False, max_frames = 0):
                     key=lambda kv: -kv[1],
                 ),
                 "in_frame_by_class": in_frame_counter.most_common(),
+                                "sports_mode": sports_mode,
+                                "distance_leaders": sorted(
+                                distance_pixels_by_player_id.items(), key=lambda kv: -kv[1]
+                )[:distance_leaderboard_size],
             }
             frame = draw_dashboard(frame, stats)
 
@@ -354,10 +454,11 @@ def main(source, save_video = False, headless = False, max_frames = 0):
     elapsed = time.time() - t_start
     write_summary(
         {"source": source, "frames": frames, "zone_peak": zone_peak,
-         "loiter_alerts": loiter_alerts},
+         "loiter_alerts": loiter_alerts, "sports_mode": sports_mode,
+         "distance_pixels_by_player_id": distance_pixels_by_player_id},
         id_to_class, unique_by_class, elapsed,
     )
-
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Mini VSaaS analytics demo (trial2)")
     parser.add_argument("--source", default=source,
@@ -368,7 +469,10 @@ if __name__ == "__main__":
                         help="Run without a display window (for servers / testing)")
     parser.add_argument("--max-frames", type=int, default=0,
                         help="Stop after N frames (0 = whole video)")
+    parser.add_argument("--sports", action="store_true",
+                        help="Sports mode: track people only")
     args = parser.parse_args()
     source = int(args.source) if str(args.source).isdigit() else args.source
     main(source, save_video = args.save_video,
-         headless = args.headless, max_frames = args.max_frames)
+         headless = args.headless, max_frames = args.max_frames,
+         sports_mode = args.sports)
