@@ -50,7 +50,7 @@ max_plausible_step_pixels = 120.0 # bigger jumps are tracker ID swaps, not runni
 distance_leaderboard_size = 5     # how many players to list on the dashboard
 
 # heat map configuration
-heat_decay = 0.985 # per-frame fade (closer to 1.0 = longer memory)
+heat_decay = 0.9 # per-frame fade (closer to 1.0 = longer memory)
 heat_radius = 22 # size of the blob stamped per object (pixels)
 heat_weight = 1.0 # heat added per object per frame
 heat_loiter_bonus = 4.0 # extra heat for objects sitting in the zone
